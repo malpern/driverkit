@@ -1,5 +1,22 @@
 #include "driverkit.hpp"
+#include <chrono>
+#include <cstdio>
+#include <ctime>
 #include <exception>
+#include <string>
+
+static std::string log_ts() {
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+    std::time_t t = system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d vhid-client:",
+                  tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<int>(ms.count()));
+    return buf;
+}
 
 template<typename T>
 int send_key(T& keyboard, struct DKEvent* e) {
@@ -9,6 +26,10 @@ int send_key(T& keyboard, struct DKEvent* e) {
     #ifdef USE_KEXT
     return pqrs::karabiner_virtual_hid_device_methods::post_keyboard_input_report(connect, keyboard);
     #else
+    // Keep the absolute report set synchronized with physical intent even
+    // while the sink is unavailable. The next successful full-state report
+    // then cannot resurrect a key whose release arrived during recovery.
+    if(!sink_ready.load(std::memory_order_acquire)) return 2;
     client->async_post_report(keyboard);
     return 0;
     #endif
@@ -98,37 +119,45 @@ int init_sink() {
         auto copy = client;
 
         client->connected.connect([copy] {
-            std::cout << "connected" << std::endl;
+            std::cout << log_ts() << " connected" << std::endl;
             pqrs::karabiner::driverkit::virtual_hid_device_service::virtual_hid_keyboard_parameters parameters;
             parameters.set_country_code(pqrs::hid::country_code::us);
             copy->async_virtual_hid_keyboard_initialize(parameters);
             copy->async_virtual_hid_pointing_initialize();
         });
 
-        client->virtual_hid_keyboard_ready.connect([](auto&& ready) {
-            std::cout << "virtual_hid_keyboard_ready " << ready << std::endl;
-            sink_ready.store(ready, std::memory_order_release);
+        client->virtual_hid_keyboard_ready.connect([copy](auto&& ready) {
+            bool was_ready = sink_ready.exchange(ready, std::memory_order_acq_rel);
+            if (was_ready != ready)
+                std::cout << log_ts() << " virtual_hid_keyboard_ready " << ready << std::endl;
+            if (ready && !was_ready) {
+                copy->async_virtual_hid_keyboard_reset();
+                std::cout << log_ts()
+                          << " virtual_hid_keyboard_reset sent after ready transition"
+                          << std::endl;
+            }
         });
 
         client->virtual_hid_pointing_ready.connect([](auto&& ready) {
-            std::cout << "virtual_hid_pointing_ready " << ready << std::endl;
-            pointing_sink_ready.store(ready, std::memory_order_release);
+            bool was_ready = pointing_sink_ready.exchange(ready, std::memory_order_acq_rel);
+            if (was_ready != ready)
+                std::cout << log_ts() << " virtual_hid_pointing_ready " << ready << std::endl;
         });
 
         client->closed.connect([] {
-            std::cout << "closed" << std::endl;
+            std::cout << log_ts() << " closed" << std::endl;
             sink_ready.store(false, std::memory_order_release);
             pointing_sink_ready.store(false, std::memory_order_release);
         });
 
         client->connect_failed.connect([](auto&& error_code) {
-            std::cout << "connect_failed " << error_code << std::endl;
+            std::cout << log_ts() << " connect_failed " << error_code << std::endl;
             sink_ready.store(false, std::memory_order_release);
             pointing_sink_ready.store(false, std::memory_order_release);
         });
 
         client->error_occurred.connect([](auto&& error_code) {
-            std::cout << "error_occurred " << error_code << std::endl;
+            std::cout << log_ts() << " error_occurred " << error_code << std::endl;
             sink_ready.store(false, std::memory_order_release);
             pointing_sink_ready.store(false, std::memory_order_release);
         });
@@ -136,7 +165,7 @@ int init_sink() {
         client->driver_activated.connect([](auto&& driver_activated) {
             static std::optional<bool> previous_value;
             if (previous_value != driver_activated) {
-                std::cout << "driver activated: " << std::boolalpha  << driver_activated << std::endl;
+                std::cout << log_ts() << " driver activated: " << std::boolalpha  << driver_activated << std::endl;
                 previous_value = driver_activated;
             }
         });
@@ -144,7 +173,7 @@ int init_sink() {
         client->driver_connected.connect([](auto&& driver_connected) {
             static std::optional<bool> previous_value;
             if (previous_value != driver_connected) {
-                std::cout << "driver connected: " << driver_connected << std::endl;
+                std::cout << log_ts() << " driver connected: " << driver_connected << std::endl;
                 previous_value = driver_connected;
             }
         });
@@ -152,7 +181,7 @@ int init_sink() {
         client->driver_version_mismatched.connect([](auto&& driver_version_mismatched) {
             static std::optional<bool> previous_value;
             if (previous_value != driver_version_mismatched) {
-                std::cout << "driver version matched: " << !driver_version_mismatched << std::endl;
+                std::cout << log_ts() << " driver version matched: " << !driver_version_mismatched << std::endl;
                 previous_value = driver_version_mismatched;
             }
         });
@@ -577,7 +606,6 @@ extern "C" {
         else
             return 1;
         #else
-        if(!sink_ready.load(std::memory_order_acquire)) return 2;
         auto usage_page = pqrs::hid::usage_page::value_t(e->page);
         if(usage_page == pqrs::hid::usage_page::keyboard_or_keypad)
             return send_key(keyboard, e);
