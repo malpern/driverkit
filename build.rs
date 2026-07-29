@@ -31,8 +31,9 @@ fn main() {
 
     build.compile("driverkit");
 
-    println!("cargo:rerun-if-changed=c_src/c_src/driverkit.hpp");
-    println!("cargo:rerun-if-changed=c_src/c_src/driverkit.cpp");
+    println!("cargo:rerun-if-changed=c_src/driverkit.hpp");
+    println!("cargo:rerun-if-changed=c_src/driverkit.cpp");
+    println!("cargo:rerun-if-changed=c_src/input_event_ordering.hpp");
     println!("cargo:rustc-link-lib=framework=IOKit");
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
 }
